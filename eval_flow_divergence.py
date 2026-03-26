@@ -20,27 +20,28 @@ Metrics:
 Usage:
     # Single pair (GT mode)
     python eval_flow_divergence.py \
-        --gt_video assets/camera/01.mp4 \
-        --gen_video assets/camera/01_wangame.mp4 \
-        --output_dir outputs/flow_eval/camera_01
+        --gt_video /mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/1_wasd_only/05.mp4 \
+        --gen_video /mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/1_wasd_only/05_wangame.mp4 \
+        --output_dir outputs/flow_eval/1_wasd_only_05
 
     # Batch mode: entire scenario directory
     python eval_flow_divergence.py \
-        --scenario_dir assets/camera \
+        --scenario_dir /mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/camera \
         --output_dir outputs/flow_eval/camera
 
     # Synthetic mode (no GT video needed)
     python eval_flow_divergence.py \
         --synthetic \
-        --gen_video assets/camera/01_wangame.mp4 \
-        --action_file assets/camera/01_action.npy \
+        --gen_video /mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/camera/01_wangame.mp4 \
+        --action_file /mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/camera4hold_alpha1/01_action.npy \
         --calibration calibration.json \
-        --output_dir outputs/flow_eval_synth/camera_01
+        --output_dir outputs/flow_eval_synth/camera_02
 """
 
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -59,6 +60,7 @@ from ptlflow.utils.flow_utils import flow_to_rgb
 from ptlflow.utils.io_adapter import IOAdapter
 from ptlflow.utils.utils import tensor_dict_to_numpy
 
+CKPT_PATH = "/mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/ptlflow/dpflow-things-2012b5d6.ckpt"
 
 # ---------------------------------------------------------------------------
 # Frame extraction
@@ -321,9 +323,19 @@ def compute_frame_metrics(
     metrics["mf_epe"] = float(np.linalg.norm(mean_gt - mean_gen))
 
     # Mean flow angular error & cosine similarity
+    # Tiny mean-flow vectors are directionally unstable. Treat one-small/one-large
+    # as orthogonal mismatch rather than letting a near-zero vector produce a
+    # spuriously good angle by chance.
+    mf_min_mag = 0.1
     mag_gt = np.linalg.norm(mean_gt)
     mag_gen = np.linalg.norm(mean_gen)
-    if mag_gt > 1e-6 and mag_gen > 1e-6:
+    if mag_gt < mf_min_mag and mag_gen < mf_min_mag:
+        metrics["mf_angle_err"] = 0.0
+        metrics["mf_cosine"] = 1.0
+    elif mag_gt < mf_min_mag or mag_gen < mf_min_mag:
+        metrics["mf_angle_err"] = 90.0
+        metrics["mf_cosine"] = 0.0
+    elif mag_gt > 1e-6 and mag_gen > 1e-6:
         cos_sim = np.dot(mean_gt, mean_gen) / (mag_gt * mag_gen)
         cos_sim = float(np.clip(cos_sim, -1.0, 1.0))
         metrics["mf_angle_err"] = float(np.degrees(np.arccos(cos_sim)))
@@ -1013,6 +1025,10 @@ def evaluate_pair_synthetic(
         frames_gen = frames_gen[:n_use]
         if frames_gt is not None:
             frames_gt = frames_gt[:n_use]
+        actions = {
+            key: value[:n_use] if hasattr(value, "__getitem__") else value
+            for key, value in actions.items()
+        }
         n_frames = n_use
 
     # --- Load flow model if not provided ---
@@ -1506,7 +1522,7 @@ def parse_args():
     parser.add_argument("--gen_video", type=str, help="Path to generated video")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--model", type=str, default="dpflow", help="Optical flow model name (default: dpflow)")
-    parser.add_argument("--ckpt", type=str, default="things", help="Model checkpoint (default: things)")
+    parser.add_argument("--ckpt", type=str, default=CKPT_PATH, help="Model checkpoint (default: things)")
     parser.add_argument("--grid_size", type=int, default=8, help="Grid size for spatial EPE (default: 8)")
     parser.add_argument("--no_viz", action="store_true", help="Skip visualization generation")
 
@@ -1517,33 +1533,551 @@ def parse_args():
                         help="Path to calibration.json (for --synthetic)")
     parser.add_argument("--no_depth", action="store_true",
                         help="Skip depth estimation, use constant depth (for --synthetic)")
+    parser.add_argument(
+        "--validation_json",
+        type=str,
+        help="Path to validation JSON. Used for synthetic auto-sweep to load action_file by index.",
+    )
+    parser.add_argument(
+        "--validation_idx",
+        type=int,
+        default=0,
+        help="Validation sample index for synthetic auto-sweep (default: 0).",
+    )
+    parser.add_argument(
+        "--validation_indices",
+        type=str,
+        default="",
+        help="Validation indices for synthetic auto-sweep. Supports ranges and lists, "
+             "e.g. 2-7 or 2,3,4,5,6,7. If set, overrides --validation_idx.",
+    )
+    parser.add_argument(
+        "--video_root",
+        type=str,
+        help="Directory containing validation_step_* videos for synthetic auto-sweep.",
+    )
+    parser.add_argument(
+        "--inference_steps_tag",
+        type=int,
+        default=40,
+        help="Filename tag in validation videos: validation_step_*_inference_steps_{tag}_video_*.mp4",
+    )
+    parser.add_argument(
+        "--train_steps",
+        type=str,
+        default="",
+        help="Comma-separated training steps to evaluate (e.g. 0,100,200). "
+             "If empty, auto-discover from files and use --step_stride filter.",
+    )
+    parser.add_argument(
+        "--step_stride",
+        type=int,
+        default=1000,
+        help="When auto-discovering training steps, only keep steps divisible by this value (default: 1000).",
+    )
+    parser.add_argument(
+        "--best_metric",
+        type=str,
+        default="pixel_epe_mean_mean",
+        help="Metric key used to pick best step from step-average table "
+             "(default: pixel_epe_mean_mean).",
+    )
+    parser.add_argument(
+        "--merge_with_existing_output",
+        action="store_true",
+        help="When set, rebuild all summaries/csv from all existing "
+             "idx_*/step_*/summary.json under --output_dir (not only this run).",
+    )
     return parser.parse_args()
+
+
+def _resolve_action_path_from_validation_json(
+    validation_json: str,
+    validation_idx: int,
+) -> str:
+    """Load action path from validation json at a specific index."""
+    validation_json_path = Path(validation_json)
+    if not validation_json_path.exists():
+        raise FileNotFoundError(f"validation json not found: {validation_json}")
+
+    with open(validation_json_path, "r") as f:
+        payload = json.load(f)
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise ValueError(f"Invalid validation json format: missing list field 'data' in {validation_json}")
+    if validation_idx < 0 or validation_idx >= len(data):
+        raise IndexError(
+            f"validation_idx={validation_idx} out of range [0, {len(data) - 1}] for {validation_json}"
+        )
+
+    sample = data[validation_idx]
+    action_path = sample.get("action_path")
+    if not action_path:
+        raise ValueError(
+            f"No action_path found at data[{validation_idx}] in {validation_json}"
+        )
+
+    action_path = Path(action_path)
+    if not action_path.is_absolute():
+        action_path = (validation_json_path.parent / action_path).resolve()
+    return str(action_path)
+
+
+def _discover_validation_step_videos(
+    video_root: str,
+    validation_idx: int,
+    inference_steps_tag: int,
+) -> Dict[int, str]:
+    """Return mapping: train_step -> video_path for matching validation videos."""
+    root = Path(video_root)
+    if not root.exists():
+        raise FileNotFoundError(f"video_root not found: {video_root}")
+
+    pattern = re.compile(
+        rf"^validation_step_(\d+)_inference_steps_{inference_steps_tag}_video_{validation_idx}\.mp4$"
+    )
+    step_to_video: Dict[int, str] = {}
+    for path in root.glob("validation_step_*_inference_steps_*_video_*.mp4"):
+        m = pattern.match(path.name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        step_to_video[step] = str(path)
+    return step_to_video
+
+
+def _parse_train_steps(train_steps: str) -> List[int]:
+    """Parse comma-separated steps string into sorted unique integer list."""
+    if not train_steps.strip():
+        return []
+    parsed = set()
+    for token in train_steps.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parsed.add(int(token))
+    return sorted(parsed)
+
+
+def _parse_validation_indices(
+    validation_indices: str,
+    fallback_idx: int,
+) -> List[int]:
+    """Parse validation indices from a range/list string.
+
+    Examples
+    --------
+    "2-7" -> [2, 3, 4, 5, 6, 7]
+    "2,4,6" -> [2, 4, 6]
+    """
+    spec = validation_indices.strip()
+    if not spec:
+        return [fallback_idx]
+
+    parsed = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            start = int(left.strip())
+            end = int(right.strip())
+            if end < start:
+                raise ValueError(
+                    f"Invalid validation index range '{token}': end < start"
+                )
+            for idx in range(start, end + 1):
+                parsed.add(idx)
+        else:
+            parsed.add(int(token))
+
+    if not parsed:
+        raise ValueError("No validation indices parsed from --validation_indices")
+    return sorted(parsed)
+
+
+def _load_existing_summaries_from_output(output_root: Path) -> List[Dict]:
+    """Load per-(step, idx) summaries from output_root/idx_*/step_*/summary.json."""
+    summaries: List[Dict] = []
+    for idx_dir in sorted(output_root.glob("idx_*")):
+        if not idx_dir.is_dir():
+            continue
+        try:
+            idx = int(idx_dir.name.split("_", 1)[1])
+        except Exception:
+            continue
+
+        for step_dir in sorted(idx_dir.glob("step_*")):
+            if not step_dir.is_dir():
+                continue
+            try:
+                step = int(step_dir.name.split("_", 1)[1])
+            except Exception:
+                continue
+            summary_path = step_dir / "summary.json"
+            if not summary_path.exists():
+                continue
+            try:
+                with open(summary_path, "r") as f:
+                    summary = json.load(f)
+            except Exception:
+                continue
+            summary["train_step"] = step
+            summary["validation_idx"] = idx
+            summaries.append(summary)
+    return summaries
+
+
+def _plot_step_metric_trends(
+    step_avg_rows: List[Dict],
+    scalar_keys: List[str],
+    output_root: Path,
+) -> Optional[Path]:
+    """Plot 9 metrics in a 3x3 grid over training steps.
+
+    If train steps are multiples of 1000, x-axis is displayed as 0, 1, ..., 10
+    (i.e., step / 1000), matching checkpoints 0, 1000, ..., 10000.
+    """
+    if not step_avg_rows:
+        return None
+
+    rows = sorted(step_avg_rows, key=lambda r: int(r["train_step"]))
+    steps = [int(r["train_step"]) for r in rows]
+
+    if steps and all(step % 1000 == 0 for step in steps):
+        x_vals = [step // 1000 for step in steps]
+        x_label = "Training Step Index (x1000)"
+        x_ticks = list(range(min(x_vals), max(x_vals) + 1))
+    else:
+        x_vals = list(range(len(steps)))
+        x_label = "Training Step Index"
+        x_ticks = x_vals
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12), sharex=True)
+    flat_axes = axes.flatten()
+
+    for ax, metric in zip(flat_axes, scalar_keys):
+        y_vals = []
+        for r in rows:
+            v = r.get(metric)
+            y_vals.append(np.nan if v is None else float(v))
+
+        ax.plot(x_vals, y_vals, marker="o", linewidth=1.8, markersize=4)
+        ax.set_title(metric)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel(x_label)
+        ax.tick_params(axis="x", labelbottom=True)
+
+        # Highlight best point per metric.
+        if metric == "mf_cosine_mean":
+            best_idx = int(np.nanargmax(y_vals))
+        elif metric == "mf_mag_ratio_mean":
+            arr = np.asarray(y_vals, dtype=np.float64)
+            best_idx = int(np.nanargmin(np.abs(arr - 1.0)))
+        else:
+            best_idx = int(np.nanargmin(y_vals))
+        ax.scatter([x_vals[best_idx]], [y_vals[best_idx]], color="red", s=30, zorder=3)
+
+    for ax in flat_axes:
+        ax.set_xticks(x_ticks)
+
+    fig.suptitle("Metric Trends Across Training Steps", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out_path = output_root / "metric_trends_3x3.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
 
 
 def main():
     args = parse_args()
 
     if args.synthetic:
-        if not args.gen_video:
-            print("Error: --gen_video is required with --synthetic")
-            sys.exit(1)
-        if not args.action_file:
-            print("Error: --action_file is required with --synthetic")
-            sys.exit(1)
         if not args.calibration:
             print("Error: --calibration is required with --synthetic")
             sys.exit(1)
-        evaluate_pair_synthetic(
-            gen_video=args.gen_video,
-            action_path=args.action_file,
-            calibration_path=args.calibration,
-            output_dir=args.output_dir,
-            model_name=args.model,
-            ckpt=args.ckpt,
-            grid_size=args.grid_size,
-            no_viz=args.no_viz,
-            use_depth=not args.no_depth,
+
+        # Mode A: original single-video synthetic evaluation
+        if args.gen_video:
+            if not args.action_file:
+                print("Error: --action_file is required with --synthetic when --gen_video is provided")
+                sys.exit(1)
+            evaluate_pair_synthetic(
+                gen_video=args.gen_video,
+                action_path=args.action_file,
+                calibration_path=args.calibration,
+                output_dir=args.output_dir,
+                model_name=args.model,
+                ckpt=args.ckpt,
+                grid_size=args.grid_size,
+                no_viz=args.no_viz,
+                use_depth=not args.no_depth,
+            )
+            return
+
+        # Mode B: synthetic auto-sweep over validation_step_* videos
+        if not args.validation_json:
+            print("Error: --validation_json is required for synthetic auto-sweep")
+            sys.exit(1)
+        if not args.video_root:
+            print("Error: --video_root is required for synthetic auto-sweep")
+            sys.exit(1)
+
+        validation_indices = _parse_validation_indices(
+            args.validation_indices,
+            args.validation_idx,
         )
+        print(f"Using validation indices: {validation_indices}")
+
+        idx_to_action_path: Dict[int, str] = {}
+        idx_to_step_to_video: Dict[int, Dict[int, str]] = {}
+        for idx in validation_indices:
+            action_path = _resolve_action_path_from_validation_json(
+                args.validation_json,
+                idx,
+            )
+            idx_to_action_path[idx] = action_path
+            print(f"Resolved action file from validation_json[{idx}]: {action_path}")
+
+            step_to_video = _discover_validation_step_videos(
+                video_root=args.video_root,
+                validation_idx=idx,
+                inference_steps_tag=args.inference_steps_tag,
+            )
+            if not step_to_video:
+                print(
+                    "Error: no matching videos found with pattern "
+                    f"validation_step_*_inference_steps_{args.inference_steps_tag}_video_{idx}.mp4 "
+                    f"under {args.video_root}"
+                )
+                sys.exit(1)
+            idx_to_step_to_video[idx] = step_to_video
+
+        requested_steps = _parse_train_steps(args.train_steps)
+        if requested_steps:
+            eval_step_set = set(requested_steps)
+            for idx in validation_indices:
+                idx_steps = set(idx_to_step_to_video[idx].keys())
+                missing = sorted(eval_step_set - idx_steps)
+                if missing:
+                    print(f"Warning: idx {idx} missing requested steps: {missing}")
+                eval_step_set &= idx_steps
+            eval_steps = sorted(eval_step_set)
+        else:
+            eval_step_set = set(idx_to_step_to_video[validation_indices[0]].keys())
+            for idx in validation_indices[1:]:
+                eval_step_set &= set(idx_to_step_to_video[idx].keys())
+            eval_steps = sorted(eval_step_set)
+            stride = max(int(args.step_stride), 1)
+            eval_steps = [s for s in eval_steps if s % stride == 0]
+
+        if not eval_steps:
+            print("Error: no steps selected for evaluation after filtering")
+            sys.exit(1)
+
+        print(
+            f"Evaluating {len(eval_steps)} shared step(s) across {len(validation_indices)} indices: "
+            f"{eval_steps}"
+        )
+        output_root = Path(args.output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        summaries: List[Dict] = []
+        for step in eval_steps:
+            for idx in validation_indices:
+                gen_video = idx_to_step_to_video[idx][step]
+                action_path = idx_to_action_path[idx]
+                pair_output = output_root / f"idx_{idx}" / f"step_{step}"
+                print(f"\n{'='*60}")
+                print(f"Synthetic evaluation at training step {step}, idx {idx}")
+                print(f"Gen video: {gen_video}")
+                print(f"Output: {pair_output}")
+                print(f"{'='*60}")
+                summary = evaluate_pair_synthetic(
+                    gen_video=gen_video,
+                    action_path=action_path,
+                    calibration_path=args.calibration,
+                    output_dir=str(pair_output),
+                    model_name=args.model,
+                    ckpt=args.ckpt,
+                    grid_size=args.grid_size,
+                    no_viz=args.no_viz,
+                    use_depth=not args.no_depth,
+                )
+                if summary:
+                    summary["train_step"] = step
+                    summary["validation_idx"] = idx
+                    summaries.append(summary)
+
+        if summaries:
+            if args.merge_with_existing_output:
+                merged = _load_existing_summaries_from_output(output_root)
+                if merged:
+                    summaries = merged
+                    print(
+                        f"Loaded {len(summaries)} summaries from existing output tree under {output_root}"
+                    )
+                else:
+                    print(
+                        f"Warning: --merge_with_existing_output is set but no existing summaries found under {output_root}"
+                    )
+
+            # De-duplicate by (train_step, validation_idx), prefer later entries.
+            deduped: Dict[Tuple[int, int], Dict] = {}
+            for row in summaries:
+                key = (int(row["train_step"]), int(row["validation_idx"]))
+                deduped[key] = row
+            summaries = list(deduped.values())
+            summaries = sorted(
+                summaries,
+                key=lambda x: (x["train_step"], x["validation_idx"]),
+            )
+            json_path = output_root / "all_summaries.json"
+            with open(json_path, "w") as f:
+                json.dump(summaries, f, indent=2, default=str)
+            print(f"\nWrote aggregated summaries: {json_path}")
+
+            scalar_keys = [
+                "mf_epe_mean",
+                "mf_angle_err_mean",
+                "mf_cosine_mean",
+                "mf_mag_ratio_mean",
+                "pixel_epe_mean_mean",
+                "px_angle_rmse_mean",
+                "fl_all_mean",
+                "foe_dist_mean",
+                "flow_kl_2d_mean",
+            ]
+            csv_path = output_root / "all_summaries.csv"
+            with open(csv_path, "w", newline="") as f:
+                fieldnames = ["train_step", "validation_idx"] + scalar_keys
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in summaries:
+                    writer.writerow({k: row.get(k) for k in fieldnames})
+            print(f"Wrote aggregated table: {csv_path}")
+
+            # Aggregate averages across validation indices for each train step.
+            step_avg_rows = []
+            std_keys = [f"{k}_std" for k in scalar_keys]
+            aggregate_steps = sorted({int(r["train_step"]) for r in summaries})
+            for step in aggregate_steps:
+                rows = [r for r in summaries if r["train_step"] == step]
+                if not rows:
+                    continue
+                avg_row: Dict[str, float | int] = {
+                    "train_step": step,
+                    "num_indices": len(rows),
+                }
+                for k in scalar_keys:
+                    vals = [r[k] for r in rows if r.get(k) is not None]
+                    if vals:
+                        avg_row[k] = float(np.mean(vals))
+                        avg_row[f"{k}_std"] = float(np.std(vals))
+                    else:
+                        avg_row[k] = None
+                        avg_row[f"{k}_std"] = None
+                step_avg_rows.append(avg_row)
+
+            step_avg_json = output_root / "step_average_summaries.json"
+            with open(step_avg_json, "w") as f:
+                json.dump(step_avg_rows, f, indent=2, default=str)
+            print(f"Wrote step-average summaries: {step_avg_json}")
+
+            step_avg_csv = output_root / "step_average_summaries.csv"
+            with open(step_avg_csv, "w", newline="") as f:
+                fieldnames = ["train_step", "num_indices"] + scalar_keys + std_keys
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in step_avg_rows:
+                    writer.writerow({k: row.get(k) for k in fieldnames})
+            print(f"Wrote step-average table: {step_avg_csv}")
+
+            trend_fig = _plot_step_metric_trends(
+                step_avg_rows=step_avg_rows,
+                scalar_keys=scalar_keys,
+                output_root=output_root,
+            )
+            if trend_fig is not None:
+                print(f"Wrote metric trend figure: {trend_fig}")
+
+            # Additional trend table with step-to-step deltas (based on step averages).
+            trend_path = output_root / "score_change_trend.csv"
+            delta_keys = [f"{k}_delta" for k in scalar_keys]
+            with open(trend_path, "w", newline="") as f:
+                fieldnames = ["train_step", "num_indices"] + scalar_keys + delta_keys
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                prev_row = None
+                for row in step_avg_rows:
+                    out_row = {k: row.get(k) for k in ["train_step", "num_indices"] + scalar_keys}
+                    for k in scalar_keys:
+                        cur = row.get(k)
+                        prev = None if prev_row is None else prev_row.get(k)
+                        out_row[f"{k}_delta"] = (
+                            None if prev is None or cur is None else (cur - prev)
+                        )
+                    writer.writerow(out_row)
+                    prev_row = row
+            print(f"Wrote score-change trend: {trend_path}")
+
+            # Pick best steps from step-average table for all scalar metrics.
+            metric_rules: Dict[str, str] = {}
+            for metric in scalar_keys:
+                if metric == "mf_cosine_mean":
+                    metric_rules[metric] = "max"
+                elif metric == "mf_mag_ratio_mean":
+                    metric_rules[metric] = "closest_to_1"
+                else:
+                    metric_rules[metric] = "min"
+
+            best_by_metric: Dict[str, Dict[str, float | int | str]] = {}
+            for metric, rule in metric_rules.items():
+                valid_rows = [r for r in step_avg_rows if r.get(metric) is not None]
+                if not valid_rows:
+                    continue
+                if rule == "max":
+                    best_row = max(valid_rows, key=lambda x: x[metric])
+                elif rule == "closest_to_1":
+                    best_row = min(valid_rows, key=lambda x: abs(x[metric] - 1.0))
+                else:
+                    best_row = min(valid_rows, key=lambda x: x[metric])
+                best_by_metric[metric] = {
+                    "train_step": int(best_row["train_step"]),
+                    "metric_value": float(best_row[metric]),
+                    "selection_rule": rule,
+                    "num_indices": int(best_row["num_indices"]),
+                }
+
+            best_all_info = {
+                "validation_indices": sorted({int(r["validation_idx"]) for r in summaries}),
+                "num_steps": len(step_avg_rows),
+                "metrics": best_by_metric,
+            }
+            best_all_path = output_root / "best_steps_by_metric.json"
+            with open(best_all_path, "w") as f:
+                json.dump(best_all_info, f, indent=2, default=str)
+            print(f"Wrote best-steps-by-metric summary: {best_all_path}")
+
+            # Backward-compatible single metric summary.
+            best_metric = args.best_metric
+            if best_metric in best_by_metric:
+                best_info = {
+                    "best_metric": best_metric,
+                    "selection_rule": best_by_metric[best_metric]["selection_rule"],
+                    "best_train_step": best_by_metric[best_metric]["train_step"],
+                    "best_metric_value": best_by_metric[best_metric]["metric_value"],
+                    "num_indices": best_by_metric[best_metric]["num_indices"],
+                    "validation_indices": best_all_info["validation_indices"],
+                }
+                best_path = output_root / "best_step.json"
+                with open(best_path, "w") as f:
+                    json.dump(best_info, f, indent=2, default=str)
+                print(f"Wrote best-step summary: {best_path}")
+            else:
+                print(f"Warning: metric '{best_metric}' not found in step-average rows; skip best-step selection.")
     elif args.gt_video:
         if not args.gen_video:
             print("Error: --gen_video is required when using --gt_video")

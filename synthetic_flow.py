@@ -269,6 +269,8 @@ class SyntheticFlowGenerator:
 
         # We generate T-1 flows (matching frame pairs)
         n_flows = T - 1
+        if frames is not None:
+            n_flows = min(n_flows, max(len(frames) - 1, 0))
         flows = []
         depths = []
         for i in range(n_flows):
