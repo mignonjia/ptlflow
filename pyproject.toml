@@ -44,6 +44,9 @@ dependencies = [
     "timm<1.1",
 ]
 
+[project.optional-dependencies]
+hf = ["huggingface_hub>=0.19"]
+
 [project.urls]
 "Source Code" = "https://github.com/hmorimitsu/ptlflow"
 "Documentation" = "https://ptlflow.readthedocs.io/"

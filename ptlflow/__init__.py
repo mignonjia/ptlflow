@@ -28,6 +28,7 @@ import torch
 from torch import hub
 
 from ptlflow.models.base_model.base_model import BaseModel
+from ptlflow.utils.checkpoint_utils import resolve_checkpoint_path
 
 from ptlflow.utils.registry import (
     _models_dict,
@@ -81,7 +82,7 @@ def get_model(
     model_name : str
         Name of the model to get an instance of.
     ckpt_path : Optional[str], optional
-        Name of the pretrained weight to load or a path to a local checkpoint file.
+        Checkpoint path or alias.
     args : Optional[Namespace], optional
         Some arguments that ill be provided to the model.
 
@@ -204,7 +205,7 @@ def load_checkpoint(ckpt_path: str, model_ref: BaseModel) -> Dict[str, Any]:
     Parameters
     ----------
     ckpt_path : str
-        Path to a local file or name of a pretrained checkpoint.
+        Checkpoint path or alias.
     model_ref : BaseModel
         A reference to the model class. See the function get_model_reference() for more details.
 
@@ -217,21 +218,7 @@ def load_checkpoint(ckpt_path: str, model_ref: BaseModel) -> Dict[str, Any]:
     --------
     get_model_reference : To get a reference to the class of a model.
     """
-    if Path(ckpt_path).exists():
-        ckpt_path = ckpt_path
-    elif hasattr(model_ref, "pretrained_checkpoints"):
-        tmp_ckpt_path = model_ref.pretrained_checkpoints.get(ckpt_path)
-        if tmp_ckpt_path is None:
-            raise ValueError(
-                f"Invalid checkpoint name {ckpt_path}. "
-                f'Choose one from {{{",".join(model_ref.pretrained_checkpoints.keys())}}}'
-            )
-        else:
-            ckpt_path = tmp_ckpt_path
-    else:
-        raise ValueError(
-            f"Cannot find checkpoint {ckpt_path} for model {model_ref.__name__}"
-        )
+    ckpt_path = resolve_checkpoint_path(ckpt_path, model_ref)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -259,7 +246,7 @@ def restore_model(model, ckpt_path):
     model : BaseModel
         An instance of the model to be restored.
     ckpt_path : str
-        Path to a local file or name of a pretrained checkpoint.
+        Checkpoint path or alias.
 
     Returns
     -------

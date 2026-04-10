@@ -61,8 +61,6 @@ from ptlflow.utils.io_adapter import IOAdapter
 from ptlflow.utils.utils import tensor_dict_to_numpy
 from scipy.integrate import trapezoid
 
-CKPT_PATH = "/mnt/weka/home/hao.zhang/mhuo/FastVideo/examples/training/finetune/WanGame2.1_1.3b_i2v/to_shao/ptlflow/dpflow-things-2012b5d6.ckpt"
-
 # ---------------------------------------------------------------------------
 # Frame extraction
 # ---------------------------------------------------------------------------
@@ -1523,7 +1521,12 @@ def parse_args():
     parser.add_argument("--gen_video", type=str, help="Path to generated video")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--model", type=str, default="dpflow", help="Optical flow model name (default: dpflow)")
-    parser.add_argument("--ckpt", type=str, default=CKPT_PATH, help="Model checkpoint (default: things)")
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default="hf://mignonjia/dpflow-ckpt/dpflow-things-2012b5d6.ckpt",
+        help="Model checkpoint path",
+    )
     parser.add_argument("--grid_size", type=int, default=8, help="Grid size for spatial EPE (default: 8)")
     parser.add_argument("--no_viz", action="store_true", help="Skip visualization generation")
 

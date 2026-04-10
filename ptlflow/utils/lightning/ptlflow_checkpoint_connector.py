@@ -13,12 +13,10 @@
 # limitations under the License.
 import logging
 import os
-from pathlib import Path
 import re
 from typing import Optional
 
 import torch
-from torch import hub
 from fsspec.core import url_to_fs
 
 import lightning.pytorch as pl
@@ -30,6 +28,7 @@ from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities.migration import pl_legacy_patch
 from lightning.pytorch.utilities.migration.utils import _pl_migrate_checkpoint
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from ptlflow.utils.checkpoint_utils import resolve_checkpoint_path
 
 log = logging.getLogger(__name__)
 
@@ -56,30 +55,10 @@ class _PTLFlowCheckpointConnector(_CheckpointConnector):
             log.debug("`checkpoint_path` not specified. Skipping checkpoint loading.")
             return
 
-        if not Path(checkpoint_path).exists():
-            if model is not None:
-                model_ref = model.__class__
-                if hasattr(model_ref, "pretrained_checkpoints"):
-                    checkpoint_path = model_ref.pretrained_checkpoints.get(
-                        checkpoint_path
-                    )
-                    if checkpoint_path is None:
-                        raise ValueError(
-                            f"Invalid checkpoint name {checkpoint_path}. "
-                            f'Choose one from {{{",".join(model_ref.pretrained_checkpoints.keys())}}}'
-                        )
-
-                    cache_path = (
-                        Path(hub.get_dir())
-                        / "checkpoints"
-                        / checkpoint_path.split("/")[-1]
-                    )
-                    if cache_path.exists():
-                        checkpoint_path = cache_path
-            else:
-                raise ValueError(
-                    f"Cannot find checkpoint {checkpoint_path} for model {model.__class__.__name__}"
-                )
+        model_ref = model.__class__ if model is not None else None
+        checkpoint_path = resolve_checkpoint_path(
+            checkpoint_path, model_ref, force_local=True
+        )
 
         rank_zero_info(
             f"Restoring states from the checkpoint path at {checkpoint_path}"
